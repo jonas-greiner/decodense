@@ -30,12 +30,36 @@ class CompKeys:
     xc = "XC"
     struct = "Struct."
     el = "Elect."
+    ext_el = "Ext. Elect."
+    ext_nuc = "Ext. Nuc."
     tot = "Total"
     charge_atom = "Charge"
     atoms = "Atom"
     orbitals = "Orbital"
     mo_occ = "Occup."
     orbsym = "Symm."
+
+
+comp_key_dict = {
+    "Coul.": "coul",
+    "Exch.": "exch",
+    "Kin.": "kin",
+    "Solv.": "solvent",
+    "E_ne (1)": "nuc_att_glob",
+    "E_ne (2)": "nuc_att_loc",
+    "E_ne": "nuc_att",
+    "XC": "xc",
+    "Struct.": "struct",
+    "Elect.": "el",
+    "Ext. Elect.": "ext_el",
+    "Ext. Nuc.": "ext_nuc",
+    "Total": "tot",
+    "Charge": "charge_atom",
+    "Atom": "atoms",
+    "Orbital": "orbitals",
+    "Occup.": "occup",
+    "Symm.": "symm",
+}
 
 
 class DecompCls(object):
@@ -108,6 +132,7 @@ def sanity_check(
     decomp: DecompCls,
     mo_coeff: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
     mo_occ: Optional[Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]],
+    ad: bool,
 ):
     """
     this function performs sanity checks of decomp attributes
@@ -201,19 +226,44 @@ def sanity_check(
         "`debye`"
     )
     # mo coefficients
-    assert isinstance(mo_coeff, np.ndarray) or isinstance(
-        mo_coeff, tuple
-    ), "invalid mo coefficients. must be a numpy array or tuple of numpy arrays"
     if isinstance(mo_coeff, np.ndarray):
         assert (
             mo_coeff.ndim == 2 or mo_coeff.ndim == 3
         ), "invalid mo coefficients. must be a numpy array of dimension 2 or 3"
     elif isinstance(mo_coeff, tuple):
+        try:
+            assert (
+                len(mo_coeff) == 2
+                and isinstance(mo_coeff[0], np.ndarray)
+                and isinstance(mo_coeff[1], np.ndarray)
+            ), "invalid mo coefficients. must be a tuple of two numpy arrays"
+        except AssertionError:
+            try:
+                from jax import Array
+
+                assert (
+                    len(mo_coeff) == 2
+                    and ((ad and isinstance(mo_coeff[0], Array)))
+                    and ((ad and isinstance(mo_coeff[1], Array)))
+                )
+            except (ImportError, AssertionError):
+                raise AssertionError(
+                    "invalid mo coefficients. must be a tuple of two numpy arrays"
+                )
+
+    else:
+        try:
+            from jax import Array
+
+            assert isinstance(mo_coeff, Array)
+        except (ImportError, AssertionError):
+            raise AssertionError(
+                "invalid mo coefficients. must be a numpy array or tuple of numpy arrays"
+            )
         assert (
-            len(mo_coeff) == 2
-            and isinstance(mo_coeff[0], np.ndarray)
-            and isinstance(mo_coeff[1], np.ndarray)
-        ), "invalid mo coefficients. must be a tuple of two numpy arrays"
+            mo_coeff.ndim == 2 or mo_coeff.ndim == 3
+        ), "invalid mo coefficients. must be a numpy array of dimension 2 or 3"
+
     # mo occupation
     assert (
         mo_occ is None or isinstance(mo_occ, np.ndarray) or isinstance(mo_occ, tuple)
@@ -228,3 +278,18 @@ def sanity_check(
             and isinstance(mo_occ[0], np.ndarray)
             and isinstance(mo_occ[1], np.ndarray)
         ), "invalid mo occupation. must be a tuple of two numpy arrays"
+
+    # ad assertions
+    if ad:
+        from jax import config as jax_config
+        from pyscfad import config as pyscfad_config
+
+        assert jax_config.read("jax_enable_x64"), (
+            "set jax.config.update('jax_enable_x64', True) to ensure double precision "
+            "floats are used during automatic differentiation"
+        )
+        assert pyscfad_config.scf_implicit_diff, (
+            "set pyscfad.config.update('pyscfad_scf_implicit_diff', True) to ensure "
+            "CPHF equations are used instead of applying the chain rule to the SCF "
+            "equations"
+        )

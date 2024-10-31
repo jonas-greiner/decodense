@@ -29,6 +29,17 @@ except ImportError:
 MAX_CYCLE = 100
 NATORB_THRES = 1.0e-12
 
+AD = False
+adnp = np
+
+
+def set_adnp(adnp_in):
+    """
+    this function sets the AD numpy package
+    """
+    global adnp
+    adnp = adnp_in
+
 
 class Logger(object):
     """
@@ -265,11 +276,40 @@ def res_sub(res_a, res_b):
     return {key: res_a[key] - res_b[key] for key in res_a.keys()}
 
 
-def contract(eqn, *tensors):
+def contract(eqn, *tensors, ad=False):
     """
     interface to optimized einsum operation
     """
-    if OE_AVAILABLE:
+    if ad:
+        # jax.numpy.einsum automatically uses opt_einsum when optimize=True
+        return adnp.einsum(eqn, *tensors, optimize=True)
+    elif OE_AVAILABLE:
         return oe.contract(eqn, *tensors)
     else:
         return np.einsum(eqn, *tensors, optimize=True)
+
+
+def pad_stack(
+    tup_arr: Tuple[np.ndarray, np.ndarray], pad_len: int, pad_axis: int
+) -> np.ndarray:
+    """
+    this function combines two arrays with alpha and beta spin while padding with zeros
+    along one axis
+    """
+    arr_alpha = adnp.pad(
+        tup_arr[0],
+        tuple(
+            (0, pad_len - tup_arr[0].shape[axis]) if axis == pad_axis - 1 else (0, 0)
+            for axis in range(tup_arr[0].ndim)
+        ),
+        "constant",
+    )
+    arr_beta = adnp.pad(
+        tup_arr[1],
+        tuple(
+            (0, pad_len - tup_arr[1].shape[axis]) if axis == pad_axis - 1 else (0, 0)
+            for axis in range(tup_arr[1].ndim)
+        ),
+        "constant",
+    )
+    return adnp.stack((arr_alpha, arr_beta))

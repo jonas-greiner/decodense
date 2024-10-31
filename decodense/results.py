@@ -15,7 +15,7 @@ import pandas as pd
 from pyscf import gto
 from typing import Dict, Tuple, Any, Optional
 
-from .decomp import CompKeys, DecompCls
+from .decomp import comp_key_dict, CompKeys, DecompCls
 from .tools import git_version, dim
 
 TOLERANCE = 1.0e-10
@@ -26,6 +26,26 @@ AU_TO_EV = 27.211386245988
 AU_TO_KJ_MOL = 2625.4996394799
 # https://calculla.com/dipole_moment_units_converter
 AU_TO_DEBYE = 2.54174623
+
+
+class ResultsCls:
+    """
+    class that holds decodense results
+    """
+
+    def __init__(self, mol: gto.Mole, res: Dict[str, Any], print_unit: str, ndo: bool):
+        self.mol = mol
+        self.res_dict = res
+        self.print_unit = print_unit
+        self.ndo = ndo
+        for key, value in self.res_dict.items():
+            setattr(self, comp_key_dict[key], value)
+
+    def __str__(self):
+        if CompKeys.charge_atom in self.res_dict:
+            return str(atoms(self.mol, self.res_dict, self.print_unit))
+        else:
+            return str(orbs(self.mol, self.res_dict, self.print_unit, self.ndo))
 
 
 def info(decomp: DecompCls, mol: Optional[gto.Mole] = None, **kwargs: float) -> str:
@@ -127,7 +147,6 @@ def atoms(mol: gto.Mole, res: Dict[str, Any], unit: str) -> pd.DataFrame:
             for comp_key in res.keys()
             if comp_key != CompKeys.charge_atom
         }
-        prop[CompKeys.tot] = prop[CompKeys.el] + prop[CompKeys.struct]
     else:
         prop = {
             comp_key + axis: res[comp_key][:, ax_idx] * scaling
@@ -135,10 +154,6 @@ def atoms(mol: gto.Mole, res: Dict[str, Any], unit: str) -> pd.DataFrame:
             for ax_idx, axis in enumerate((" (x)", " (y)", " (z)"))
             if comp_key != CompKeys.charge_atom
         }
-        for ax_idx, axis in enumerate((" (x)", " (y)", " (z)")):
-            prop[CompKeys.tot + axis] = (
-                prop[CompKeys.el + axis] + prop[CompKeys.struct + axis]
-            )
     # partial charges
     prop[CompKeys.charge_atom] = res[CompKeys.charge_atom]
     # atom symbols
@@ -187,27 +202,19 @@ def orbs(mol: gto.Mole, res: Dict[str, Any], unit: str, ndo: bool) -> pd.DataFra
     # property contributions
     if scalar_prop:
         prop = {
-            comp_key: np.append(res[comp_key][0], res[comp_key][1])[mo_idx]
+            comp_key: np.append(res[comp_key][0], res[comp_key][1])[mo_idx] * scaling
             for comp_key in res.keys()
             if comp_key not in (CompKeys.struct, CompKeys.charge_atom)
         }
-        prop[CompKeys.struct] = np.sum(res[CompKeys.struct]) / mo_occ.size
-        prop[CompKeys.tot] = prop[CompKeys.el] + prop[CompKeys.struct]
     else:
         prop = {
             CompKeys.el
             + axis: np.vstack((res[CompKeys.el][0], res[CompKeys.el][1]))[
                 mo_idx[:, None], ax_idx
             ].ravel()
+            * scaling
             for ax_idx, axis in enumerate((" (x)", " (y)", " (z)"))
         }
-        for ax_idx, axis in enumerate((" (x)", " (y)", " (z)")):
-            prop[CompKeys.struct + axis] = (
-                np.sum(res[CompKeys.struct], axis=0)[ax_idx] / mo_occ.size
-            )
-            prop[CompKeys.tot + axis] = (
-                prop[CompKeys.el + axis] + prop[CompKeys.struct + axis]
-            )
     # add mo occupations, orbital symmetries, and structural contributions to dict
     prop[CompKeys.mo_occ] = mo_occ[mo_idx]
     prop[CompKeys.orbsym] = orbsym[mo_idx]

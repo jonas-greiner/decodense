@@ -19,6 +19,22 @@ from typing import List, Union, Tuple
 
 from .tools import dim, contract
 
+AD = False
+adnp = np
+adiao = lo.iao
+adorth = lo.orth
+
+
+def set_adnp(ad, adnp_in, adiao_in, adorth_in):
+    """
+    this function sets the AD numpy package
+    """
+    global AD, adnp, adiao, adorth
+    AD = ad
+    adnp = adnp_in
+    adiao = adiao_in
+    adorth = adorth_in
+
 
 def assign_rdm1s(
     mol: Union[gto.Mole, pbc_gto.Cell],
@@ -39,7 +55,7 @@ def assign_rdm1s(
 
     # rhf reference
     if mo_occ[0].size == mo_occ[1].size:
-        rhf = np.allclose(mo_coeff[0], mo_coeff[1]) and np.allclose(
+        rhf = adnp.allclose(mo_coeff[0], mo_coeff[1]) and adnp.allclose(
             mo_occ[0], mo_occ[1]
         )
     else:
@@ -52,9 +68,6 @@ def assign_rdm1s(
 
     # molecular dimensions
     alpha, beta = dim(mo_occ)
-
-    # max number of occupied spin-orbs
-    n_spin = max(alpha.size, beta.size)
 
     # mol object projected into minao basis
     if pop_method == "iao":
@@ -70,8 +83,8 @@ def assign_rdm1s(
     # number of atoms
     natm = pmol.natm
 
-    # AO labels
-    ao_labels = pmol.ao_labels(fmt=None)
+    # AO slices per atom
+    ao_slices = pmol.aoslice_by_atom()[:, 2:]
 
     # overlap matrix
     if pop_method == "mulliken":
@@ -88,9 +101,9 @@ def assign_rdm1s(
             return _population_becke(charge_matrix, mo)
         else:
             # orbital-specific rdm1s
-            rdm1_orb = contract("p,ip,jp->ijp", mocc, mo, mo)
+            rdm1_orb = contract("p,ip,jp->ijp", mocc, mo, mo, ad=AD)
             # population weights of rdm1_orb
-            return _population_mul(natm, ao_labels, ovlp, rdm1_orb)
+            return _population_mul(natm, ao_slices, ovlp, rdm1_orb)
 
     # init population weights array
     weights = []
@@ -107,6 +120,7 @@ def assign_rdm1s(
                 lo.orth.orth_ao(pmol, method="lowdin", s=s),
                 s,
                 mo_coeff[i][:, spin_mo],
+                ad=AD,
             )
         elif pop_method == "meta_lowdin":
             mo = contract(
@@ -114,11 +128,12 @@ def assign_rdm1s(
                 lo.orth.orth_ao(pmol, method="meta_lowdin", s=s),
                 s,
                 mo_coeff[i][:, spin_mo],
+                ad=AD,
             )
         elif pop_method == "iao":
-            iao = lo.iao.iao(mol, mo_coeff[i][:, spin_mo], minao=minao)
-            iao = lo.vec_lowdin(iao, s)
-            mo = contract("ki,kl,lj->ij", iao, s, mo_coeff[i][:, spin_mo])
+            iao = adiao.iao(mol, mo_coeff[i][:, spin_mo], minao=minao)
+            iao = adorth.vec_lowdin(iao, s)
+            mo = contract("ki,kl,lj->ij", iao, s, mo_coeff[i][:, spin_mo], ad=AD)
         elif pop_method == "becke":
             if getattr(pmol, "pbc_intor", None):
                 raise NotImplementedError("PM becke scheme for PBC systems")
@@ -179,20 +194,40 @@ def assign_rdm1s(
 
 
 def _population_mul(
-    natm: int, ao_labels: np.ndarray, ovlp: np.ndarray, rdm1: np.ndarray
+    natm: int, ao_slices: np.ndarray, ovlp: np.ndarray, rdm1: np.ndarray
 ) -> np.ndarray:
     """
     this function returns the mulliken populations on the individual atoms
     """
-    # init populations
-    populations = np.zeros((rdm1.shape[2], natm), dtype=np.float64)
 
     # mulliken population array
     pop = contract("ijp,ji->ip", rdm1, ovlp)
 
-    # loop over AOs
-    for ao_pop, k in zip(pop, ao_labels):
-        populations[:, k[0]] += ao_pop
+    if not AD:
+        # init populations
+        populations = np.empty((rdm1.shape[2], natm), dtype=np.float64)
+
+        # loop over atoms
+        for iatm in range(natm):
+            populations[:, iatm] = np.sum(
+                pop[ao_slices[iatm, 0] : ao_slices[iatm, 1]], axis=0
+            )
+    else:
+        from jax import vmap
+
+        # define vectorization function
+        def fn(ao_slice: np.ndarray, pop: np.ndarray, idx: np.ndarray) -> np.ndarray:
+            # directly slicing does not work because dynamic shapes are not allowed
+            # within transforms, instead we fill the values we do not want with zeros
+            # and sum the entire array
+            mask = (idx >= ao_slice[0]) & (idx < ao_slice[1])
+            return adnp.where(mask, pop, 0.0).sum(axis=0)
+
+        # vectorize over atoms
+        idx = np.arange(pop.shape[0])
+        populations = vmap(fn, in_axes=(0, None, None), out_axes=1)(
+            ao_slices, pop, idx[:, None]
+        )
 
     return populations
 

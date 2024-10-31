@@ -22,7 +22,9 @@ from .decomp import DecompCls, sanity_check
 from .orbitals import assign_rdm1s
 from .properties import prop_tot
 from .tools import write_rdm1
-from .results import fmt
+from .results import ResultsCls
+
+from decodense import loader
 
 
 def main(
@@ -32,12 +34,18 @@ def main(
     mo_coeff: Union[np.ndarray, Tuple[np.ndarray, np.ndarray]],
     mo_occ: Optional[Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]] = None,
     rdm1: Optional[np.ndarray] = None,
+    ad: bool = False,
+    ext_el: Optional[np.ndarray] = None,
+    ext_nuc: Optional[np.ndarray] = None,
 ) -> pd.DataFrame:
     """
     main decodense program
     """
+    # AD config
+    loader.load_adnp(ad)
+
     # sanity check
-    sanity_check(mol, mf, decomp, mo_coeff, mo_occ)
+    sanity_check(mol, mf, decomp, mo_coeff, mo_occ, ad)
 
     # ensure mo coefficients are in the correct shape
     if isinstance(mo_coeff, np.ndarray):
@@ -81,10 +89,12 @@ def main(
         decomp.ndo,
         decomp.gauge_origin,
         weights,
+        ext_el,
+        ext_nuc,
     )
 
     # write rdm1s
     if decomp.write != "":
         write_rdm1(mol, decomp.part, mo_coeff, mo_occ, decomp.write, weights)
 
-    return fmt(mol, decomp.res, decomp.unit, decomp.ndo)
+    return ResultsCls(mol, decomp.res, decomp.unit, decomp.ndo)

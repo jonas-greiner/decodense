@@ -22,11 +22,25 @@ from pyscf.pbc.dft import numint as pbc_numint
 from typing import List, Tuple, Dict, Union, Any, Optional
 
 from .pbctools import ewald_e_nuc, get_nuc_pbc
-from .tools import dim, make_rdm1, orbsym, contract
+from .tools import dim, make_rdm1, orbsym, contract, pad_stack
 from .decomp import CompKeys
 
 # block size in _mm_pot()
 BLKSIZE = 200
+
+AD = False
+adnp = np
+addft = dft
+
+
+def set_adnp(ad, adnp_in, addft_in):
+    """
+    this function sets the AD numpy package
+    """
+    global AD, adnp, addft
+    AD = ad
+    adnp = adnp_in
+    addft = addft_in
 
 
 def prop_tot(
@@ -49,18 +63,15 @@ def prop_tot(
     ndo: bool,
     gauge_origin: np.ndarray,
     weights: List[np.ndarray],
+    ext_el: Optional[np.ndarray],
+    ext_nuc: Optional[np.ndarray],
 ) -> Dict[str, Union[np.ndarray, List[np.ndarray]]]:
     """
     this function returns atom-decomposed mean-field properties
     """
-    # declare nested kernel functions in global scope
-    global prop_atom
-    global prop_eda
-    global prop_orb
-
     # restricted reference
     if mo_occ[0].size == mo_occ[1].size:
-        restrict = np.allclose(mo_coeff[0], mo_coeff[1]) and np.allclose(
+        restrict = adnp.allclose(mo_coeff[0], mo_coeff[1]) and adnp.allclose(
             mo_occ[0], mo_occ[1]
         )
     else:
@@ -78,12 +89,12 @@ def prop_tot(
 
     # compute total 1-RDMs (AO basis)
     if rdm1 is None:
-        rdm1 = np.array(
+        rdm1 = adnp.array(
             [make_rdm1(mo_coeff[0], mo_occ[0]), make_rdm1(mo_coeff[1], mo_occ[1])]
         )
     if rdm1.ndim == 2:
-        rdm1 = np.array([rdm1, rdm1]) * 0.5
-    rdm1_tot = np.array(
+        rdm1 = adnp.array([rdm1, rdm1]) * 0.5
+    rdm1_tot = adnp.array(
         [make_rdm1(mo_coeff[0], mo_occ[0]), make_rdm1(mo_coeff[1], mo_occ[1])]
     )
 
@@ -119,6 +130,8 @@ def prop_tot(
             prop_nuc_rep = _e_nuc(pmol, mm_mol)
     elif prop_type == "dipole":
         prop_nuc_rep = _dip_nuc(pmol, gauge_origin)
+    if part == "orbitals":
+        prop_nuc_rep = np.sum(prop_nuc_rep, axis=0)
 
     # core hamiltonian
     kin, nuc, sub_nuc, mm_pot = _h_core(mol, mm_mol, mf)
@@ -156,7 +169,7 @@ def prop_tot(
 
     # calculate xc energy density
     if dft_calc:
-        # inititialize class for xc paramters
+        # initialize class for xc paramters
         xc_params = XCParams()
         # ndo assertion
         if ndo:
@@ -177,7 +190,7 @@ def prop_tot(
             xc_params.ao_value, rdm1, xc_type
         )
         # evaluate xc energy density
-        xc_params.eps_xc = dft.libxc.eval_xc(
+        xc_params.eps_xc = addft.libxc.eval_xc(
             mf.xc, rho_tot, spin=0 if rho_tot.ndim == 2 else 1
         )[0]
         # nlc (vv10)
@@ -215,42 +228,84 @@ def prop_tot(
         """
         # init results
         res: Dict[str, Union[float, np.ndarray]] = {}
-        # atom-specific rdm1
-        rdm1_atom = np.zeros_like(rdm1_tot)
-        # loop over spins
+
+        # init coulomb and exchange contributions
         if prop_type == "energy" and not restrict:
             res[CompKeys.coul] = 0.0
             res[CompKeys.exch] = 0.0
-        for i, spin_mo in enumerate((alpha, beta)):
-            # loop over spin-orbitals
-            for m, j in enumerate(spin_mo):
-                # get orbital(s)
-                orb = mo_coeff[i][:, j].reshape(mo_coeff[i].shape[0], -1)
+
+        # loop over spins
+        if not AD:
+            # atom-specific rdm1
+            rdm1_atom = np.zeros_like(rdm1_tot)
+            for i, spin_mo in enumerate((alpha, beta)):
+                # loop over spin-orbitals
+                for m, j in enumerate(spin_mo):
+                    # get orbital(s)
+                    orb = mo_coeff[i][:, j].reshape(mo_coeff[i].shape[0], -1)
+                    # orbital-specific rdm1
+                    rdm1_orb = make_rdm1(orb, mo_occ[i][j])
+                    # weighted contribution to rdm1_atom
+                    rdm1_atom[i] += (
+                        rdm1_orb * weights[i][m][atom_idx] / np.sum(weights[i][m])
+                    )
+                # coulumb & exchange energy associated with given atom
+                if prop_type == "energy" and not restrict:
+                    res[CompKeys.coul] += _trace(
+                        np.sum(vj, axis=0), rdm1_atom[i], scaling=0.5
+                    )
+                    res[CompKeys.exch] -= _trace(vk[i], rdm1_atom[i], scaling=0.5)
+        else:
+            from jax import vmap
+
+            # max padding length
+            max_len = max(len(alpha), len(beta))
+
+            # stack padded arrays
+            mo_occ_arr = pad_stack((mo_occ[0][alpha], mo_occ[1][beta]), max_len, 1)
+            mo_coeff_arr = pad_stack(
+                (mo_coeff[0][:, alpha], mo_coeff[1][:, beta]), max_len, 2
+            )
+            weights_arr = pad_stack(
+                (
+                    weights[0][alpha, atom_idx] / np.sum(weights[0][alpha], axis=1),
+                    weights[1][beta, atom_idx] / np.sum(weights[1][beta], axis=1),
+                ),
+                max_len,
+                1,
+            )
+
+            def _atom_rdm1(mo_occ, mo_coeff, weights):
                 # orbital-specific rdm1
-                rdm1_orb = make_rdm1(orb, mo_occ[i][j])
+                rdm1_orb = adnp.einsum("i,mi,ni->imn", mo_occ, mo_coeff, mo_coeff)
                 # weighted contribution to rdm1_atom
-                rdm1_atom[i] += (
-                    rdm1_orb * weights[i][m][atom_idx] / np.sum(weights[i][m])
-                )
-            # coulumb & exchange energy associated with given atom
-            if prop_type == "energy" and not restrict:
-                res[CompKeys.coul] += _trace(
-                    np.sum(vj, axis=0), rdm1_atom[i], scaling=0.5
-                )
-                res[CompKeys.exch] -= _trace(vk[i], rdm1_atom[i], scaling=0.5)
+                return adnp.einsum("imn,i->mn", rdm1_orb, weights)
+
+            # weighted contribution to rdm1_atom
+            rdm1_atom = vmap(_atom_rdm1, (0, 0, 0))(
+                mo_occ_arr, mo_coeff_arr, weights_arr
+            )
+
+            for i, spin_mo in enumerate((alpha, beta)):
+                # coulumb & exchange energy associated with given atom
+                if prop_type == "energy" and not restrict:
+                    res[CompKeys.coul] += _trace(
+                        np.sum(vj, axis=0), rdm1_atom[i], scaling=0.5
+                    )
+                    res[CompKeys.exch] -= _trace(vk[i], rdm1_atom[i], scaling=0.5)
         # common energy contributions associated with given atom
         if prop_type == "energy":
             if restrict:
                 res[CompKeys.coul] = _trace(vj, np.sum(rdm1_atom, axis=0), scaling=0.5)
                 res[CompKeys.exch] = -_trace(
-                    vk, np.sum(rdm1_atom, axis=0), scaling=0.25
+                    vk, np.sum(rdm1_atom, axis=0), scaling=0.25, ad=AD
                 )
-            res[CompKeys.kin] = _trace(kin, np.sum(rdm1_atom, axis=0))
+            res[CompKeys.kin] = _trace(kin, np.sum(rdm1_atom, axis=0), ad=AD)
             res[CompKeys.nuc_att_loc] = _trace(
-                nuc, np.sum(rdm1_atom, axis=0), scaling=0.5
+                nuc, np.sum(rdm1_atom, axis=0), scaling=0.5, ad=AD
             )
             res[CompKeys.nuc_att_glob] = _trace(
-                sub_nuc[atom_idx], np.sum(rdm1_tot, axis=0), scaling=0.5
+                sub_nuc[atom_idx], np.sum(rdm1_tot, axis=0), scaling=0.5, ad=AD
             )
             if mm_pot is not None:
                 res[CompKeys.solvent] = _trace(mm_pot, np.sum(rdm1_atom, axis=0))
@@ -274,6 +329,8 @@ def prop_tot(
                     res[CompKeys.xc] += _e_xc(
                         xc_params.eps_xc_nlc, xc_params.grid_weights_nlc, rho_atom_vv10
                     )
+            if ext_el is not None:
+                res[CompKeys.ext_el] = _trace(ext_el, np.sum(rdm1_atom, axis=0))
         elif prop_type == "dipole":
             res[CompKeys.el] = -_trace(ao_dip, np.sum(rdm1_atom, axis=0))
         # sum up electronic contributions
@@ -296,7 +353,7 @@ def prop_tot(
                     vj[select], np.sum(rdm1_tot, axis=0)[select], scaling=0.5
                 )
                 res[CompKeys.exch] = -_trace(
-                    vk[select], np.sum(rdm1_tot, axis=0)[select], scaling=0.25
+                    vk[select], np.sum(rdm1_tot, axis=0)[select], scaling=0.25, ad=AD
                 )
             else:
                 res[CompKeys.coul] = 0.0
@@ -309,12 +366,14 @@ def prop_tot(
                     res[CompKeys.exch] -= _trace(
                         vk[i][select], rdm1_tot[i][select], scaling=0.5
                     )
-            res[CompKeys.kin] = _trace(kin[select], np.sum(rdm1_tot, axis=0)[select])
+            res[CompKeys.kin] = _trace(
+                kin[select], np.sum(rdm1_tot, axis=0)[select], ad=AD
+            )
             res[CompKeys.nuc_att_loc] = _trace(
-                nuc[select], np.sum(rdm1_tot, axis=0)[select], scaling=0.5
+                nuc[select], np.sum(rdm1_tot, axis=0)[select], scaling=0.5, ad=AD
             )
             res[CompKeys.nuc_att_glob] = _trace(
-                sub_nuc[atom_idx], np.sum(rdm1_tot, axis=0), scaling=0.5
+                sub_nuc[atom_idx], np.sum(rdm1_tot, axis=0), scaling=0.5, ad=AD
             )
             if mm_pot is not None:
                 res[CompKeys.solvent] = _trace(
@@ -354,6 +413,10 @@ def prop_tot(
                     res[CompKeys.xc] += _e_xc(
                         xc_params.eps_xc_nlc, xc_params.grid_weights_nlc, rho_atom_vv10
                     )
+            if ext_el is not None:
+                res[CompKeys.ext_el] = _trace(
+                    ext_el[select], np.sum(rdm1_tot, axis=0)[select]
+                )
         elif prop_type == "dipole":
             res[CompKeys.el] = -_trace(
                 ao_dip[:, select], np.sum(rdm1_tot, axis=0)[select]
@@ -377,12 +440,12 @@ def prop_tot(
         if prop_type == "energy":
             if restrict:
                 res[CompKeys.coul] = _trace(vj, rdm1_orb, scaling=0.5)
-                res[CompKeys.exch] = -_trace(vk, rdm1_orb, scaling=0.25)
+                res[CompKeys.exch] = -_trace(vk, rdm1_orb, scaling=0.25, ad=AD)
             else:
                 res[CompKeys.coul] = _trace(np.sum(vj, axis=0), rdm1_orb, scaling=0.5)
                 res[CompKeys.exch] = -_trace(vk[spin_idx], rdm1_orb, scaling=0.5)
-            res[CompKeys.kin] = _trace(kin, rdm1_orb)
-            res[CompKeys.nuc_att] = _trace(nuc, rdm1_orb)
+            res[CompKeys.kin] = _trace(kin, rdm1_orb, ad=AD)
+            res[CompKeys.nuc_att] = _trace(nuc, rdm1_orb, ad=AD)
             if mm_pot is not None:
                 res[CompKeys.solvent] = _trace(mm_pot, rdm1_orb)
             # additional xc energy contribution
@@ -401,6 +464,8 @@ def prop_tot(
                     res[CompKeys.xc] += _e_xc(
                         xc_params.eps_xc_nlc, xc_params.grid_weights_nlc, rho_orb_vv10
                     )
+            if ext_el is not None:
+                res[CompKeys.ext_el] = _trace(ext_el, rdm1_orb)
         elif prop_type == "dipole":
             res[CompKeys.el] = -_trace(ao_dip, rdm1_orb)
         # sum up electronic contributions
@@ -415,25 +480,20 @@ def prop_tot(
         domain = np.arange(pmol.natm)
         # execute kernel
         res = list(map(prop_atom if part == "atoms" else prop_eda, domain))
-        # init atom-specific energy or dipole arrays
-        if prop_type == "energy":
-            prop = {
-                comp_key: np.zeros(pmol.natm, dtype=np.float64)
-                for comp_key in res[0].keys()
-            }
-        elif prop_type == "dipole":
-            prop = {
-                comp_key: np.zeros([pmol.natm, 3], dtype=np.float64)
-                for comp_key in res[0].keys()
-            }
         # collect results
-        for k, r in enumerate(res):
-            for key, val in r.items():
-                prop[key][k] = val
+        prop = {
+            key: adnp.array([atom_prop[key] for atom_prop in res])
+            for key in res[0].keys()
+        }
+
         if ndo:
             prop[CompKeys.struct] = np.zeros_like(prop_nuc_rep)
         else:
             prop[CompKeys.struct] = prop_nuc_rep
+        if ext_nuc is not None:
+            prop[CompKeys.struct] += ext_nuc
+            prop[CompKeys.ext_nuc] = ext_nuc
+        prop[CompKeys.tot] = prop[CompKeys.el] + prop[CompKeys.struct]
         return {**prop, CompKeys.charge_atom: charge_atom}
     else:  # orbs
         # domain
@@ -442,28 +502,35 @@ def prop_tot(
         )
         # execute kernel
         res = list(starmap(prop_orb, domain))  # type: ignore
-        # init orbital-specific energy or dipole array
-        if prop_type == "energy":
-            prop = {
-                comp_key: [np.zeros(alpha.size), np.zeros(beta.size)]
-                for comp_key in res[0].keys()
-            }
-        elif prop_type == "dipole":
-            prop = {
-                comp_key: [
-                    np.zeros([alpha.size, 3], dtype=np.float64),
-                    np.zeros([beta.size, 3], dtype=np.float64),
-                ]
-                for comp_key in res[0].keys()
-            }
         # collect results
-        for k, r in enumerate(res):
-            for key, val in r.items():
-                prop[key][domain[k, 0]][domain[k, 1]] = val
+        prop = {
+            key: [
+                adnp.array([atom_prop[key] for atom_prop in res[: alpha.size]]),
+                adnp.array([atom_prop[key] for atom_prop in res[alpha.size :]]),
+            ]
+            for key in res[0].keys()
+        }
         if ndo:
-            prop[CompKeys.struct] = np.zeros_like(prop_nuc_rep)
-        else:
-            prop[CompKeys.struct] = prop_nuc_rep
+            prop[CompKeys.struct] = [
+                np.zeros(alpha.size, dtype=np.float64),
+                np.zeros(beta.size, dtype=np.float64),
+            ]
+        elif prop_type == "energy":
+            prop[CompKeys.struct] = [
+                np.full(alpha.size, prop_nuc_rep / (alpha.size + beta.size)),
+                np.full(beta.size, prop_nuc_rep / (alpha.size + beta.size)),
+            ]
+        elif prop_type == "dipole":
+            prop[CompKeys.struct] = [
+                np.stack(
+                    [prop_nuc_rep / (alpha.size + beta.size)] * alpha.size, axis=0
+                ),
+                np.stack([prop_nuc_rep / (alpha.size + beta.size)] * beta.size, axis=0),
+            ]
+        prop[CompKeys.tot] = [
+            el_prop + struct_prop
+            for el_prop, struct_prop in zip(prop[CompKeys.el], prop[CompKeys.struct])
+        ]
         return {
             **prop,
             CompKeys.mo_occ: list(mo_occ),
@@ -631,7 +698,7 @@ def _make_rho_interm1(
         c0 = contract("ik,kj->ij", ao_value, rdm1)
         c1 = None
     elif xctype in ("GGA", "NLC"):
-        c0 = contract("ik,kj->ij", ao_value[0], rdm1)
+        c0 = contract("ik,kj->ij", ao_value[0], rdm1, ad=AD)
         c1 = None
     else:  # meta-GGA
         c0 = contract("ik,kj->ij", ao_value[0], rdm1)
@@ -658,10 +725,19 @@ def _make_rho_interm2(
     if xctype == "LDA" or xctype == "HF":
         rho = contract("pi,pi->p", ao_value, c0)
     elif xctype in ("GGA", "NLC"):
-        rho = np.empty((4, ngrids), dtype=np.float64)
-        rho[0] = contract("pi,pi->p", c0, ao_value[0])
-        for i in range(1, 4):
-            rho[i] = contract("pi,pi->p", c0, ao_value[i]) * 2.0
+        if not AD:
+            rho = adnp.empty((4, ngrids), dtype=np.float64)
+            rho[0] = contract("pi,pi->p", c0, ao_value[0], ad=AD)
+            for i in range(1, 4):
+                rho[i] = contract("pi,pi->p", c0, ao_value[i]) * 2.0
+        else:
+            from jax import vmap
+
+            def contract_c1(ao_value):
+                return contract("pi,pi->p", c0, ao_value, ad=AD)
+
+            rho = vmap(contract_c1)(ao_value)
+            rho = rho.at[1:4].multiply(2.0)
     else:  # meta-GGA
         assert c1 is not None
         rho = np.empty((6, ngrids), dtype=np.float64)
@@ -691,7 +767,7 @@ def _make_rho(
         c0, c1 = _make_rho_interm1(ao_value, rdm1, xc_type)
         rho = _make_rho_interm2(c0, c1, ao_value, xc_type)
     else:
-        if np.allclose(rdm1[0], rdm1[1]):
+        if adnp.allclose(rdm1[0], rdm1[1]):
             c0, c1 = _make_rho_interm1(ao_value, rdm1[0] * 2.0, xc_type)
             rho = _make_rho_interm2(c0, c1, ao_value, xc_type)
         else:
@@ -731,7 +807,7 @@ def _vk_dft(
         # scale amount of exact exchange
         vk *= ks_hyb
     else:
-        vk = np.zeros_like(vj)
+        vk = adnp.zeros_like(vj)
     # range separated coulomb operator
     if abs(ks_omega) > 1e-10:
         vk_lr = mf.get_k(mol, rdm1, omega=ks_omega)
@@ -754,13 +830,13 @@ def _ao_val(mol: gto.Mole, grids_coords: np.ndarray, ao_deriv: int) -> np.ndarra
 
 
 def _trace(
-    op: np.ndarray, rdm1: np.ndarray, scaling: float = 1.0
+    op: np.ndarray, rdm1: np.ndarray, scaling: float = 1.0, ad=False
 ) -> Union[float, np.ndarray]:
     """
     this function returns the trace between an operator and an rdm1
     """
     if op.ndim == 2:
-        return contract("ij,ij", op, rdm1) * scaling
+        return contract("ij,ij", op, rdm1, ad=ad) * scaling
     else:
         return contract("xij,ij->x", op, rdm1) * scaling
 
