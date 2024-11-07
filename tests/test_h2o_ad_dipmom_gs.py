@@ -105,6 +105,7 @@ class KnownValues(unittest.TestCase):
                 spin=spin,
             )
             mol.build(trace_coords=False, trace_exp=False, trace_ctr_coeff=False)
+            mol_pyscf = mol.to_pyscf()
 
             # get atom coordinates and charges
             coords = mol.atom_coords()
@@ -136,13 +137,13 @@ class KnownValues(unittest.TestCase):
                     # mf calc
                     if mf_method == "hf":
                         if spin == 0:
-                            mf = mol.RHF()
+                            mf = mol_pyscf.RHF()
                         elif spin_symmetry == "restricted":
-                            mf = mol.ROHF()
+                            mf = mol_pyscf.ROHF()
                         else:
-                            mf = mol.UHF()
+                            mf = mol_pyscf.UHF()
                     else:
-                        mf = mol.KS()
+                        mf = mol_pyscf.KS()
                         mf.xc = mf_method
                     mf.conv_tol = 1e-10
                     mf.kernel()
